@@ -22,6 +22,7 @@
 
 #include "example_utils.hpp"
 #include "hipfft_utils.hpp"
+#include "hiprtc_utils.hpp"
 
 #include <hip/hip_runtime.h>
 #include <hipfft/hipfft.h>
@@ -37,23 +38,39 @@ struct load_cbdata
     double               scale;
 };
 
+static const char* load_callback_src = R"(
+#ifdef __HIP_PLATFORM_AMD__
+// rocFFT expects the provided symbol to be found verbatim in the
+// compiled SPIR-V.  Give the callback function C linkage so that its
+// actual name matches its apparent name in the source code.
+#define CALLBACK_LINKAGE extern "C"
+#else
+// cuFFT expects C++ name mangling, so the linkage must be C++.
+#define CALLBACK_LINKAGE
+#endif
+
+
+struct load_cbdata
+{
+    hipDoubleComplex* filter;
+    double            scale;
+};
+
 /// \brief \return the \p input multiplied with both the filter and the scale
 /// from the \p cbdata.
-__device__ hipfftDoubleComplex load_callback(hipfftDoubleComplex* input,
-                                             size_t               offset,
-                                             void*                cbdata,
-                                             void* /*sharedMem*/)
+CALLBACK_LINKAGE
+__device__ hipDoubleComplex load_callback(hipDoubleComplex* input,
+                                          size_t               offset,
+                                          void*                cbdata,
+                                          void* /*sharedMem*/)
 {
     auto data = static_cast<load_cbdata*>(cbdata);
 
     return hipCmul(hipCmul(input[offset], data->filter[offset]),
                    make_hipDoubleComplex(data->scale, 0));
 }
+)";
 
-// Can not give __device__ function to HIP_SYMBOL
-__device__ auto load_callback_dev = load_callback;
-
-// NOTE: Function pointer callbacks are about to be deprecated, in favor of JIT callbacks.
 int main()
 {
     std::cout << "hipfft 1D double-precision complex-to-complex transform with callback\n";
@@ -90,14 +107,6 @@ int main()
     }
     std::cout << std::endl;
 
-    // Create the plan
-    hipfftHandle plan;
-    HIPFFT_CHECK(hipfftCreate(&plan));
-    HIPFFT_CHECK(hipfftPlan1d(&plan, // Plan handle
-                              Nx, // Transform length
-                              HIPFFT_Z2Z, // Transform type
-                              1)); // Number of transforms
-
     // Prepare callback
     load_cbdata h_callback_data;
     h_callback_data.filter = d_filter;
@@ -107,12 +116,32 @@ int main()
     HIP_CHECK(
         hipMemcpy(d_callback_data, &h_callback_data, sizeof(load_cbdata), hipMemcpyHostToDevice));
 
-    void* h_callback_ptr = nullptr;
-    HIP_CHECK(hipMemcpyFromSymbol(&h_callback_ptr, HIP_SYMBOL(load_callback_dev), sizeof(void*)));
+    auto load_callback_code = compile_jit_callback(load_callback_src);
+
+    int current_device = hipInvalidDeviceId;
+    int device_count   = hipInvalidDeviceId;
+    HIP_CHECK(hipGetDevice(&current_device));
+    HIP_CHECK(hipGetDeviceCount(&device_count));
+    std::vector<void*> cbdatas(device_count);
+    cbdatas[current_device] = d_callback_data;
+
+    // Create the plan
+    hipfftHandle plan;
+    HIPFFT_CHECK(hipfftCreate(&plan));
 
     // Set callback
-    HIPFFT_CHECK(
-        hipfftXtSetCallback(plan, &h_callback_ptr, HIPFFT_CB_LD_COMPLEX_DOUBLE, &d_callback_data));
+    HIPFFT_CHECK(hipfftXtSetJITCallback(plan,
+                                        "load_callback",
+                                        load_callback_code.data(),
+                                        load_callback_code.size(),
+                                        HIPFFT_CB_LD_COMPLEX_DOUBLE,
+                                        cbdatas.data()));
+
+    HIPFFT_CHECK(hipfftMakePlan1d(plan, // Plan handle
+                                  Nx, // Transform length
+                                  HIPFFT_Z2Z, // Transform type
+                                  1, // Number of transforms
+                                  nullptr)); // Work memory
 
     // Execute plan
     HIPFFT_CHECK(hipfftExecZ2Z(plan, d_data, d_data, direction));
